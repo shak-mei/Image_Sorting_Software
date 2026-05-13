@@ -1,0 +1,6 @@
+pillow
+opencv-python
+numpy
+pandas
+keyboard
+ttkbootstrap
