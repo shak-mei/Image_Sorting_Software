@@ -16,6 +16,7 @@ Keyboard shortcuts
   D / F / G     Custom category 1 / 2 / 3  (if defined)
   ← → ↑ ↓      Navigate (single view: prev/next; grid: by column/row)
   Z             Undo
+  I             Return to Inbox (move back to root folder, mark unsorted)
   G             Toggle grid / single view
   M             Toggle metadata panel
   Q             Quit
@@ -345,6 +346,7 @@ class HelpDialog(tk.Toplevel):
         for cat in categories:
             row(cat["shortcut"].upper(), f"{cat['name']}  →  moves file to  {cat['folder']}/")
         row("Z",               "Undo the last move")
+        row("I",               "Return to Inbox — move back to root folder, mark unsorted")
 
         # Views
         ttk.Label(inner, text="Views & panels", font=("Segoe UI", 9, "italic"),
@@ -670,6 +672,8 @@ class MainApp(tk.Tk):
                 self.prev_image()
         elif key == "z":
             self.undo()
+        elif key == "i":
+            self.return_to_inbox()
         elif key == "q":
             self._on_close()
         elif key == "m":
@@ -755,6 +759,10 @@ class MainApp(tk.Tk):
 
     def undo(self):
         self._sorter.undo_last_move()
+
+    def return_to_inbox(self):
+        self._sorter.return_to_inbox(advance=not self._grid_mode)
+        self._info_frame.set_status("→ Inbox", "#FF9800")
 
     def _grid_navigate(self, delta: int):
         new_idx = self._sorter.current_index + delta

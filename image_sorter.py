@@ -264,6 +264,37 @@ class ImageSorter(ttk.Frame):
         self.current_index = index
         self.show_current()
 
+    def return_to_inbox(self, advance: bool = True):
+        """Move the current image back to the root folder, marking it unsorted."""
+        if not self.all_files:
+            return
+        index = self.current_index
+        path  = self._actual_path(index)
+        fname = os.path.basename(self.all_files[index])
+        dest  = os.path.join(self.current_folder, fname)
+
+        if os.path.normpath(path) == os.path.normpath(dest):
+            return  # already in inbox
+
+        try:
+            shutil.move(path, dest)
+        except Exception as e:
+            messagebox.showerror("Move failed", str(e))
+            return
+
+        prev_status = self.status.get(fname, "")
+        self.status[fname] = ""
+        self._undo_stack.append((index, path, dest, prev_status))
+        self._locations[index] = dest
+
+        if self._on_sort:
+            self._on_sort(index, fname, "")
+
+        if advance:
+            self.next_unsorted()
+        else:
+            self.show_current()
+
     # ------------------------------------------------------------------
     # Preloading
     # ------------------------------------------------------------------
