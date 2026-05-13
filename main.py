@@ -26,8 +26,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
-import keyboard
-
 import db
 import tag_manager
 import image_sorter as sorter_module
@@ -582,22 +580,48 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _bind_keys(self):
-        keyboard.on_press_key("o",     lambda _: self.select_folder()
-                              if keyboard.is_pressed("ctrl") else None)
-        keyboard.on_press_key("right", lambda _: self.next_image())
-        keyboard.on_press_key("left",  lambda _: self.prev_image())
-        keyboard.on_press_key("z",     lambda _: self.undo())
-        keyboard.on_press_key("q",     lambda _: self.quit())
-        keyboard.on_press_key("m",     lambda _: self.toggle_metadata())
-        keyboard.on_press_key("tab",   lambda _: self.toggle_grid())
+        # Ctrl+O — open folder
+        self.bind_all("<Control-o>", lambda e: self.select_folder())
 
-        self._rebind_category_keys()
+        # All single-key shortcuts go through one handler so we can gate
+        # on focus: if a text widget (Entry, Combobox, dialog) has focus,
+        # let the keystroke through normally and skip the shortcut.
+        self.bind_all("<KeyPress>", self._on_keypress)
 
-    def _rebind_category_keys(self):
-        for cat in self._categories:
-            key = cat["shortcut"]
-            c = dict(cat)
-            keyboard.on_press_key(key, lambda _, c=c: self.sort_image(c))
+    def _focus_is_text(self) -> bool:
+        """Return True when keyboard focus is inside a text input or any dialog."""
+        focused = self.focus_get()
+        if focused is None:
+            return False
+        # Any modal dialog / Toplevel that isn't the main window
+        if focused.winfo_toplevel() is not self:
+            return True
+        return focused.winfo_class() in ("Entry", "TEntry", "TCombobox", "Text", "Listbox")
+
+    def _on_keypress(self, event: tk.Event):
+        if self._focus_is_text():
+            return  # let the widget handle the keystroke normally
+
+        key = event.keysym.lower()
+
+        if key == "right":
+            self.next_image()
+        elif key == "left":
+            self.prev_image()
+        elif key == "z":
+            self.undo()
+        elif key == "q":
+            self.quit()
+        elif key == "m":
+            self.toggle_metadata()
+        elif key == "tab":
+            self.toggle_grid()
+            return "break"   # prevent tkinter from shifting widget focus
+        else:
+            for cat in self._categories:
+                if key == cat["shortcut"].lower():
+                    self.sort_image(cat)
+                    return "break"
 
     # ------------------------------------------------------------------
     # Folder selection
@@ -726,7 +750,6 @@ class MainApp(tk.Tk):
                 for cat in self._categories:
                     Path(os.path.join(self._current_folder, cat["folder"])).mkdir(exist_ok=True)
             self._ctrl.rebuild_category_buttons(self._categories)
-            self._rebind_category_keys()
 
     # ------------------------------------------------------------------
     # Session summary
