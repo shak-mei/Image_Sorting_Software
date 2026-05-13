@@ -33,35 +33,33 @@ class ImageSorter(ttk.Frame):
                  on_image_changed=None, on_sort=None):
         super().__init__(parent)
         self.info_frame = info_frame
-        self._on_image_changed = on_image_changed  # callable(index, path)
-        self._on_sort          = on_sort            # callable(index, fname, action)
+        self._on_image_changed = on_image_changed
+        self._on_sort          = on_sort
 
         self.current_folder: str | None = None
-        self.all_files: list[str] = []   # full paths, never shrinks
-        self.status: dict[str, str] = {} # basename -> action key (empty = unsorted)
+        self.all_files: list[str] = []
+        self.status: dict[str, str] = {}
         self.current_index: int = 0
 
-        # PIL image cache {basename: PIL.Image}
         self._pil_cache: dict[str, Image.Image] = {}
         self._cache_lock = threading.Lock()
         self._preload_event = threading.Event()
         self._stop_flag = threading.Event()
 
-        # Undo stack: list of (index, original_path, new_path)
-        self._undo_stack: list[tuple[int, str, str]] = []
+        # undo stack: (index, path_before_move, path_after_move, prev_status)
+        self._undo_stack: list[tuple[int, str, str, str]] = []
+        # tracks where each file actually is now (may differ from all_files after sorting)
+        self._locations: dict[int, str] = {}
 
-        # Build UI
         self._image_label = tk.Label(self, bg="#1e1e1e")
         self._image_label.pack(expand=True, fill="both")
 
         self._play_btn = ttk.Button(self, text="▶  Play Video",
                                      command=self._play_video)
 
-        # Keep a ref so PhotoImage isn't GC'd
         self._current_photo: ImageTk.PhotoImage | None = None
         self._current_video_path: str | None = None
 
-        # Start background preloader
         t = threading.Thread(target=self._preloader_loop, daemon=True)
         t.start()
 
@@ -71,9 +69,10 @@ class ImageSorter(ttk.Frame):
 
     def select_new_folder(self, folder: str):
         self.current_folder = folder
-        self._stop_flag.set()   # pause preloader briefly
+        self._stop_flag.set()
         self._pil_cache.clear()
         self._undo_stack.clear()
+        self._locations.clear()
 
         all_names = sorted(
             f for f in os.listdir(folder)
@@ -95,11 +94,16 @@ class ImageSorter(ttk.Frame):
     # Display
     # ------------------------------------------------------------------
 
+    def _actual_path(self, index: int) -> str:
+        """Return the file's current physical location (may differ from all_files after sorting)."""
+        loc = self._locations.get(index)
+        return loc if loc is not None else self.all_files[index]
+
     def show_current(self):
         if not self.all_files:
             return
 
-        path = self.all_files[self.current_index]
+        path = self._actual_path(self.current_index)
         ext  = os.path.splitext(path)[1].lower()
         self._current_video_path = None
 
@@ -108,7 +112,7 @@ class ImageSorter(ttk.Frame):
         else:
             self._show_image(path)
 
-        fname = os.path.basename(path)
+        fname = os.path.basename(self.all_files[self.current_index])
         self.info_frame.update_file_label_and_index(
             fname, self.current_index + 1, len(self.all_files)
         )
@@ -194,7 +198,6 @@ class ImageSorter(ttk.Frame):
                 self.current_index = i
                 self.show_current()
                 return
-        # All remaining are sorted — show completion
         unsorted = sum(1 for f in self.all_files
                        if not self.status.get(os.path.basename(f)))
         if unsorted == 0:
@@ -208,12 +211,17 @@ class ImageSorter(ttk.Frame):
     # Sorting actions
     # ------------------------------------------------------------------
 
-    def sort_image(self, category: dict):
-        """Move the current image to the category's subfolder."""
+    def sort_image(self, category: dict, advance: bool = True):
+        """Move the current image to the category's subfolder.
+
+        advance=False keeps the selection in place (used in grid mode so the
+        user can re-sort the same image without auto-advancing).
+        """
         if not self.all_files:
             return
-        path = self.all_files[self.current_index]
-        fname = os.path.basename(path)
+        index = self.current_index
+        path = self._actual_path(index)
+        fname = os.path.basename(self.all_files[index])
         folder_name = category["folder"]
         dest_dir = os.path.join(self.current_folder, folder_name)
         Path(dest_dir).mkdir(exist_ok=True)
@@ -225,30 +233,34 @@ class ImageSorter(ttk.Frame):
             messagebox.showerror("Move failed", str(e))
             return
 
+        prev_status = self.status.get(fname, "")
         self.status[fname] = category["name"].lower()
-        self._undo_stack.append((self.current_index, path, dest))
+        self._undo_stack.append((index, path, dest, prev_status))
+        self._locations[index] = dest
 
         if self._on_sort:
-            self._on_sort(self.current_index, fname, category["name"].lower())
+            self._on_sort(index, fname, category["name"].lower())
 
-        self.next_unsorted()
+        if advance:
+            self.next_unsorted()
 
     def undo_last_move(self):
         if not self._undo_stack:
             messagebox.showinfo("Undo", "Nothing to undo.")
             return
 
-        index, original, moved = self._undo_stack.pop()
-        fname = os.path.basename(original)
+        index, original, moved, prev_status = self._undo_stack.pop()
+        fname = os.path.basename(self.all_files[index])
         try:
             shutil.move(moved, original)
         except Exception as e:
             messagebox.showerror("Undo failed", str(e))
             return
 
-        self.status[fname] = ""
+        self.status[fname] = prev_status
+        self._locations[index] = original
         if self._on_sort:
-            self._on_sort(index, fname, "")
+            self._on_sort(index, fname, prev_status)
         self.current_index = index
         self.show_current()
 
@@ -292,10 +304,10 @@ class ImageSorter(ttk.Frame):
         for idx in indices:
             if self._stop_flag.is_set() or self._preload_event.is_set():
                 break
-            path = self.all_files[idx]
+            path = self._actual_path(idx)
             ext  = os.path.splitext(path)[1].lower()
             if ext in VIDEO_EXTENSIONS:
-                continue  # skip preload for video
+                continue
             fname = os.path.basename(path)
             with self._cache_lock:
                 if fname in self._pil_cache:
@@ -332,5 +344,5 @@ class ImageSorter(ttk.Frame):
 
     def current_path(self) -> str | None:
         if self.all_files:
-            return self.all_files[self.current_index]
+            return self._actual_path(self.current_index)
         return None

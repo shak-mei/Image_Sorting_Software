@@ -10,70 +10,92 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-THUMB_W = 130
-THUMB_H = 100
+THUMB_SIZES = {
+    "S": (90,  70),
+    "M": (130, 100),
+    "L": (190, 148),
+}
 PADDING = 6
-COLS = 5
+COLS    = 5
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".3gp", ".m4v"}
 
-# Badge colours per action key (must match category folder names)
 BADGE_COLORS = {
-    "starred":  "#FFD700",
-    "archive":  "#A0A0A0",
+    "starred": "#FFD700",
+    "archive": "#A0A0A0",
 }
 DEFAULT_CUSTOM_BADGE = "#64B5F6"
 
-UNSORTED_BG  = "#2b2b2b"
-SELECTED_BG  = "#1565C0"
-SORTED_ALPHA = "#555555"
+UNSORTED_BG = "#2b2b2b"
+SELECTED_BG = "#1565C0"
 
 
 class GridView(ttk.Frame):
     """Thumbnail overview of all images in the current folder."""
 
-    def __init__(self, parent, on_select_callback):
+    def __init__(self, parent, on_select_callback, on_open_callback=None):
         super().__init__(parent)
-        self._on_select = on_select_callback  # called with (index: int)
+        # single click  → navigate to image, stay in grid
+        # double click  → navigate to image, return to single view
+        self._on_select = on_select_callback
+        self._on_open   = on_open_callback
 
-        self._canvas = tk.Canvas(self, bg="#1e1e1e", highlightthickness=0)
-        self._vscroll = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._thumb_w, self._thumb_h = THUMB_SIZES["M"]
+
+        # ── Toolbar ──────────────────────────────────────────────────
+        toolbar = ttk.Frame(self)
+        toolbar.pack(side="top", fill="x", padx=4, pady=(2, 0))
+        ttk.Label(toolbar, text="Size:", font=("Segoe UI", 8)).pack(side="left", padx=(0, 4))
+        self._size_var = tk.StringVar(value="M")
+        for key in ("S", "M", "L"):
+            ttk.Radiobutton(toolbar, text=key, value=key, variable=self._size_var,
+                            command=self._on_size_change).pack(side="left", padx=2)
+        ttk.Label(toolbar, text="  Double-click to open in single view",
+                  font=("Segoe UI", 7), foreground="#888888").pack(side="left", padx=10)
+
+        # ── Canvas + scrollbar ───────────────────────────────────────
+        canvas_frame = ttk.Frame(self)
+        canvas_frame.pack(side="top", fill="both", expand=True)
+
+        self._canvas = tk.Canvas(canvas_frame, bg="#1e1e1e", highlightthickness=0)
+        self._vscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._canvas.yview)
         self._canvas.configure(yscrollcommand=self._vscroll.set)
 
         self._vscroll.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
 
-        self._canvas.bind("<Configure>", self._on_resize)
-        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self._canvas.bind("<Button-1>", self._on_click)
+        self._canvas.bind("<Configure>",        self._on_resize)
+        self._canvas.bind("<MouseWheel>",        self._on_mousewheel)
+        self._canvas.bind("<Button-1>",          self._on_click)
+        self._canvas.bind("<Double-Button-1>",   self._on_double_click)
 
-        self._all_files: list[str] = []      # full paths
-        self._status: dict[str, str] = {}    # filename -> action key or ""
+        self._all_files: list[str] = []
+        self._status: dict[str, str] = {}
         self._current_index: int = -1
 
-        # Thumbnail cache: filename -> PhotoImage (main thread only)
         self._thumb_cache: dict[str, ImageTk.PhotoImage] = {}
         self._placeholder: ImageTk.PhotoImage | None = None
-
-        # Canvas item ids per index: index -> (rect_id, img_id, badge_id, label_id)
         self._items: dict[int, dict] = {}
 
         self._cols = COLS
         self._load_thread: threading.Thread | None = None
         self._stop_loading = threading.Event()
 
+    @property
+    def cols(self) -> int:
+        return self._cols
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def load_folder(self, all_files: list[str], status: dict[str, str], current_index: int):
-        """Populate the grid with all files."""
         self._stop_loading.set()
         if self._load_thread and self._load_thread.is_alive():
             self._load_thread.join(timeout=1)
 
         self._all_files = all_files
-        self._status = status
+        self._status    = status
         self._current_index = current_index
         self._thumb_cache.clear()
         self._items.clear()
@@ -85,7 +107,6 @@ class GridView(ttk.Frame):
         self._load_thread.start()
 
     def update_status(self, filename: str, action: str):
-        """Called when an image is sorted — redraw its badge."""
         self._status[filename] = action
         index = next((i for i, f in enumerate(self._all_files)
                       if os.path.basename(f) == filename), None)
@@ -93,7 +114,6 @@ class GridView(ttk.Frame):
             self.after(0, lambda: self._redraw_item(index))
 
     def set_current(self, index: int):
-        """Highlight the currently viewed image."""
         old = self._current_index
         self._current_index = index
         if old >= 0:
@@ -102,11 +122,28 @@ class GridView(ttk.Frame):
         self.after(0, lambda: self._scroll_to(index))
 
     # ------------------------------------------------------------------
+    # Size change
+    # ------------------------------------------------------------------
+
+    def _on_size_change(self):
+        self._thumb_w, self._thumb_h = THUMB_SIZES[self._size_var.get()]
+        self._placeholder = None
+        self._thumb_cache.clear()
+        self._stop_loading.set()
+        if self._load_thread and self._load_thread.is_alive():
+            self._load_thread.join(timeout=0.3)
+        self._stop_loading.clear()
+        self._render_grid()
+        if self._all_files:
+            self._load_thread = threading.Thread(target=self._load_thumbs_bg, daemon=True)
+            self._load_thread.start()
+
+    # ------------------------------------------------------------------
     # Grid rendering
     # ------------------------------------------------------------------
 
     def _cell_size(self):
-        return THUMB_W + PADDING * 2, THUMB_H + PADDING * 2 + 18  # +18 for label
+        return self._thumb_w + PADDING * 2, self._thumb_h + PADDING * 2 + 18
 
     def _cell_xy(self, index: int):
         cw, ch = self._cell_size()
@@ -123,8 +160,8 @@ class GridView(ttk.Frame):
         if not self._all_files:
             return
 
-        canvas_w = self._canvas.winfo_width() or (COLS * (THUMB_W + PADDING * 2))
-        self._cols = max(1, canvas_w // (THUMB_W + PADDING * 2))
+        canvas_w = self._canvas.winfo_width() or (COLS * (self._thumb_w + PADDING * 2))
+        self._cols = max(1, canvas_w // (self._thumb_w + PADDING * 2))
 
         cw, ch = self._cell_size()
         total_rows = (len(self._all_files) + self._cols - 1) // self._cols
@@ -139,57 +176,47 @@ class GridView(ttk.Frame):
 
     def _draw_item(self, index: int, fpath: str):
         fname = os.path.basename(fpath)
-        x, y = self._cell_xy(index)
+        x, y  = self._cell_xy(index)
         action = self._status.get(fname, "")
         is_current = (index == self._current_index)
 
-        # Background rect
         bg = SELECTED_BG if is_current else UNSORTED_BG
-        rect_id = self._canvas.create_rectangle(
-            x, y, x + THUMB_W + PADDING, y + THUMB_H + PADDING,
+        self._canvas.create_rectangle(
+            x, y, x + self._thumb_w + PADDING, y + self._thumb_h + PADDING,
             fill=bg, outline="#444444", width=2 if is_current else 1,
             tags=f"cell_{index}"
         )
 
-        # Thumbnail
         thumb = self._thumb_cache.get(fname, self._placeholder)
-        img_id = self._canvas.create_image(
-            x + PADDING // 2 + THUMB_W // 2,
-            y + PADDING // 2 + THUMB_H // 2,
+        self._canvas.create_image(
+            x + PADDING // 2 + self._thumb_w // 2,
+            y + PADDING // 2 + self._thumb_h // 2,
             image=thumb, tags=f"cell_{index}"
         )
 
-        # Badge
-        badge_id = None
         if action:
             color = BADGE_COLORS.get(action.lower(), DEFAULT_CUSTOM_BADGE)
-            badge_id = self._canvas.create_rectangle(
-                x, y, x + THUMB_W + PADDING, y + 14,
+            self._canvas.create_rectangle(
+                x, y, x + self._thumb_w + PADDING, y + 14,
                 fill=color, outline="", tags=f"cell_{index}"
             )
             self._canvas.create_text(
-                x + (THUMB_W + PADDING) // 2, y + 7,
+                x + (self._thumb_w + PADDING) // 2, y + 7,
                 text=action.upper(), fill="white",
                 font=("Segoe UI", 6, "bold"), tags=f"cell_{index}"
             )
 
-        # Label
         short_name = fname if len(fname) <= 18 else fname[:15] + "…"
-        label_id = self._canvas.create_text(
-            x + (THUMB_W + PADDING) // 2,
-            y + THUMB_H + PADDING - 4,
+        self._canvas.create_text(
+            x + (self._thumb_w + PADDING) // 2,
+            y + self._thumb_h + PADDING - 4,
             text=short_name, fill="#cccccc",
             font=("Segoe UI", 7), tags=f"cell_{index}"
         )
 
-        self._items[index] = {
-            "rect": rect_id, "img": img_id, "badge": badge_id, "label": label_id
-        }
-
     def _redraw_item(self, index: int):
         if index < 0 or index >= len(self._all_files):
             return
-        # Delete old items for this cell
         self._canvas.delete(f"cell_{index}")
         self._draw_item(index, self._all_files[index])
 
@@ -210,7 +237,6 @@ class GridView(ttk.Frame):
     # ------------------------------------------------------------------
 
     def _load_thumbs_bg(self):
-        """Load PIL thumbnails in a background thread, then push PhotoImage to main thread."""
         for i, fpath in enumerate(self._all_files):
             if self._stop_loading.is_set():
                 break
@@ -218,22 +244,22 @@ class GridView(ttk.Frame):
             if fname in self._thumb_cache:
                 continue
             try:
-                pil_img = self._load_thumb_pil(fpath)
-                # Schedule PhotoImage creation + canvas update on main thread
+                tw, th  = self._thumb_w, self._thumb_h
+                pil_img = self._load_thumb_pil(fpath, tw, th)
                 self.after(0, lambda fi=fname, pi=pil_img, idx=i: self._apply_thumb(fi, pi, idx))
             except Exception:
                 pass
 
-    def _load_thumb_pil(self, fpath: str) -> Image.Image:
+    def _load_thumb_pil(self, fpath: str, tw: int, th: int) -> Image.Image:
         ext = os.path.splitext(fpath)[1].lower()
         if ext in VIDEO_EXTENSIONS:
-            return self._video_thumb(fpath)
+            return self._video_thumb(fpath, tw, th)
         img = Image.open(fpath)
         img = self._fix_orientation(img)
-        img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+        img.thumbnail((tw, th), Image.LANCZOS)
         return img
 
-    def _video_thumb(self, fpath: str) -> Image.Image:
+    def _video_thumb(self, fpath: str, tw: int, th: int) -> Image.Image:
         if CV2_AVAILABLE:
             cap = cv2.VideoCapture(fpath)
             ok, frame = cap.read()
@@ -241,7 +267,7 @@ class GridView(ttk.Frame):
             if ok:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(frame)
-                img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+                img.thumbnail((tw, th), Image.LANCZOS)
                 return img
         return self._make_placeholder_pil()
 
@@ -255,8 +281,7 @@ class GridView(ttk.Frame):
     # ------------------------------------------------------------------
 
     def _make_placeholder_pil(self) -> Image.Image:
-        img = Image.new("RGB", (THUMB_W, THUMB_H), color=(60, 60, 60))
-        return img
+        return Image.new("RGB", (self._thumb_w, self._thumb_h), color=(60, 60, 60))
 
     def _make_placeholder(self) -> ImageTk.PhotoImage:
         return ImageTk.PhotoImage(self._make_placeholder_pil())
@@ -293,12 +318,21 @@ class GridView(ttk.Frame):
     def _on_mousewheel(self, event):
         self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    def _on_click(self, event):
+    def _index_from_event(self, event) -> int | None:
         x = self._canvas.canvasx(event.x)
         y = self._canvas.canvasy(event.y)
         cw, ch = self._cell_size()
         col = int(x // cw)
         row = int(y // ch)
         index = row * self._cols + col
-        if 0 <= index < len(self._all_files):
+        return index if 0 <= index < len(self._all_files) else None
+
+    def _on_click(self, event):
+        index = self._index_from_event(event)
+        if index is not None:
             self._on_select(index)
+
+    def _on_double_click(self, event):
+        index = self._index_from_event(event)
+        if index is not None and self._on_open:
+            self._on_open(index)

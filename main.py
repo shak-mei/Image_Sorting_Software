@@ -14,9 +14,9 @@ Keyboard shortcuts
   Ctrl+O        Open folder
   S / A         Star / Archive  (built-in)
   D / F / G     Custom category 1 / 2 / 3  (if defined)
-  ← / →         Previous / Next
+  ← → ↑ ↓      Navigate (single view: prev/next; grid: by column/row)
   Z             Undo
-  Tab           Toggle grid / single view
+  G             Toggle grid / single view
   M             Toggle metadata panel
   Q             Quit
 """
@@ -237,7 +237,7 @@ class ControlPanel(ttk.Frame):
                     command=self._app.open_category_dialog).pack(side="right", padx=4, pady=4)
         ttk.Button(self, text="ℹ Meta (M)",
                     command=self._app.toggle_metadata).pack(side="right", padx=4, pady=4)
-        ttk.Button(self, text="⊞ Grid (Tab)",
+        ttk.Button(self, text="⊞ Grid (G)",
                     command=self._app.toggle_grid).pack(side="right", padx=4, pady=4)
 
         ttk.Separator(self, orient="vertical").pack(side="right", fill="y", padx=6, pady=4)
@@ -335,7 +335,7 @@ class HelpDialog(tk.Toplevel):
         # Navigation
         ttk.Label(inner, text="Navigation", font=("Segoe UI", 9, "italic"),
                   foreground="#555555").pack(anchor="w", padx=20, pady=(4, 0))
-        row("→  /  ←",        "Next / Previous image")
+        row("→ / ← / ↓ / ↑",  "Next / Prev (single view);  or move by column / row in Grid")
         row("Ctrl + O",        "Open a folder")
         row("Q",               "Quit the application")
 
@@ -349,7 +349,7 @@ class HelpDialog(tk.Toplevel):
         # Views
         ttk.Label(inner, text="Views & panels", font=("Segoe UI", 9, "italic"),
                   foreground="#555555").pack(anchor="w", padx=20, pady=(8, 0))
-        row("Tab",             "Toggle Grid overview / Single-image view")
+        row("G",               "Toggle Grid overview / Single-image view")
         row("M",               "Toggle Metadata sidebar (EXIF, file info, tags)")
 
         # ── Tags ─────────────────────────────────────────────────────
@@ -363,7 +363,7 @@ class HelpDialog(tk.Toplevel):
         )
 
         # ── Grid view ────────────────────────────────────────────────
-        heading("Grid view  (Tab)")
+        heading("Grid view  (G)")
         para(
             "Shows all images in the folder as thumbnails. Sorted images display a "
             "coloured badge (gold = Starred, grey = Archive, blue = custom). "
@@ -489,6 +489,41 @@ class SessionSummaryDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
+# Exit confirmation dialog
+# ---------------------------------------------------------------------------
+
+class ExitConfirmDialog(tk.Toplevel):
+    """Ask the user whether to exit, optionally reviewing the session summary first."""
+
+    def __init__(self, parent, sorted_count: int, total_count: int):
+        super().__init__(parent)
+        self.title("Exit")
+        self.resizable(False, False)
+        self.grab_set()
+        self.result: str | None = None  # "exit" | "summary" | None (cancelled)
+
+        msg = (f"You have sorted {sorted_count} of {total_count} image(s).\n"
+               "Are you sure you want to quit?")
+        ttk.Label(self, text=msg, font=("Segoe UI", 10),
+                  wraplength=340, justify="center").pack(padx=24, pady=(20, 12))
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(padx=24, pady=(0, 18))
+        ttk.Button(btn_frame, text="View Summary & Exit",
+                   command=lambda: self._close("summary")).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Exit",
+                   command=lambda: self._close("exit")).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Cancel",
+                   command=lambda: self._close(None)).pack(side="left", padx=4)
+
+        self.bind("<Escape>", lambda _: self._close(None))
+
+    def _close(self, result):
+        self.result = result
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 # MainApp
 # ---------------------------------------------------------------------------
 
@@ -529,7 +564,9 @@ class MainApp(tk.Tk):
         self._sorter.pack(fill="both", expand=True)
 
         # GridView (hidden initially)
-        self._grid = GridView(self._view_frame, on_select_callback=self._on_grid_select)
+        self._grid = GridView(self._view_frame,
+                              on_select_callback=self._on_grid_select,
+                              on_open_callback=self._on_grid_open)
 
         # MetadataPanel (hidden initially)
         self._meta = MetadataPanel(self._content)
@@ -551,6 +588,7 @@ class MainApp(tk.Tk):
         # -- Keyboard shortcuts --
         self._bind_keys()
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         print("Image Sorter ready.")
 
     # ------------------------------------------------------------------
@@ -565,11 +603,11 @@ class MainApp(tk.Tk):
         bar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open Folder…   Ctrl+O", command=self.select_folder)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.quit)
+        file_menu.add_command(label="Exit", command=self._on_close)
 
         view_menu = tk.Menu(bar, tearoff=0)
         bar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Toggle Grid (Tab)",     command=self.toggle_grid)
+        view_menu.add_command(label="Toggle Grid (G)",       command=self.toggle_grid)
         view_menu.add_command(label="Toggle Metadata (M)",   command=self.toggle_metadata)
 
         sort_menu = tk.Menu(bar, tearoff=0)
@@ -611,18 +649,33 @@ class MainApp(tk.Tk):
         key = event.keysym.lower()
 
         if key == "right":
-            self.next_image()
+            if self._grid_mode:
+                self._grid_navigate(+1)
+            else:
+                self.next_image()
         elif key == "left":
-            self.prev_image()
+            if self._grid_mode:
+                self._grid_navigate(-1)
+            else:
+                self.prev_image()
+        elif key == "down":
+            if self._grid_mode:
+                self._grid_navigate(+self._grid.cols)
+            else:
+                self.next_image()
+        elif key == "up":
+            if self._grid_mode:
+                self._grid_navigate(-self._grid.cols)
+            else:
+                self.prev_image()
         elif key == "z":
             self.undo()
         elif key == "q":
-            self.quit()
+            self._on_close()
         elif key == "m":
             self.toggle_metadata()
-        elif key == "tab":
+        elif key == "g":
             self.toggle_grid()
-            return "break"   # prevent tkinter from shifting widget focus
         else:
             for cat in self._categories:
                 if key == cat["shortcut"].lower():
@@ -630,10 +683,46 @@ class MainApp(tk.Tk):
                     return "break"
 
     # ------------------------------------------------------------------
+    # Exit
+    # ------------------------------------------------------------------
+
+    def _on_close(self):
+        sorted_count = sum(1 for v in self._sorter.status.values() if v)
+        if sorted_count == 0:
+            if messagebox.askyesno("Exit", "Are you sure you want to quit?", parent=self):
+                self.destroy()
+            return
+        dlg = ExitConfirmDialog(self, sorted_count, len(self._sorter.all_files))
+        self.wait_window(dlg)
+        if dlg.result == "exit":
+            self.destroy()
+        elif dlg.result == "summary":
+            summary = SessionSummaryDialog(self, self._sorter.status,
+                                           self._current_folder or "", self._categories)
+            self.wait_window(summary)
+            self.destroy()
+
+    # ------------------------------------------------------------------
     # Folder selection
     # ------------------------------------------------------------------
 
     def select_folder(self):
+        sorted_count = sum(1 for v in self._sorter.status.values() if v)
+        if sorted_count > 0:
+            choice = messagebox.askyesnocancel(
+                "Active Session",
+                f"You have {sorted_count} sorted image(s) in the current session.\n\n"
+                "View the session summary before loading a new folder?\n\n"
+                "(Yes = show summary first,  No = skip,  Cancel = don't open)",
+                parent=self,
+            )
+            if choice is None:
+                return
+            if choice:
+                dlg = SessionSummaryDialog(self, self._sorter.status,
+                                           self._current_folder or "", self._categories)
+                self.wait_window(dlg)
+
         folder = filedialog.askdirectory(title="Select folder containing images")
         if not folder:
             return
@@ -667,12 +756,19 @@ class MainApp(tk.Tk):
     def undo(self):
         self._sorter.undo_last_move()
 
+    def _grid_navigate(self, delta: int):
+        new_idx = self._sorter.current_index + delta
+        if 0 <= new_idx < len(self._sorter.all_files):
+            self._sorter.jump_to(new_idx)
+
     # ------------------------------------------------------------------
     # Sorting
     # ------------------------------------------------------------------
 
     def sort_image(self, category: dict):
-        self._sorter.sort_image(category)
+        # In grid mode don't auto-advance; stay on the current image so the
+        # user can immediately re-sort or inspect the badge change.
+        self._sorter.sort_image(category, advance=not self._grid_mode)
 
     # ------------------------------------------------------------------
     # View toggles
@@ -680,12 +776,11 @@ class MainApp(tk.Tk):
 
     def toggle_grid(self):
         if self._grid_mode:
-            # Switch back to single view
             self._grid.pack_forget()
             self._sorter.pack(fill="both", expand=True)
             self._grid_mode = False
+            self._sorter.show_current()   # refresh info bar + image after grid navigation
         else:
-            # Switch to grid
             self._sorter.pack_forget()
             self._grid.pack(fill="both", expand=True)
             self._grid.set_current(self._sorter.current_index)
@@ -739,9 +834,14 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_grid_select(self, index: int):
+        """Single click — navigate to image, stay in grid."""
         self._sorter.jump_to(index)
-        # Switch back to single view for editing
-        self.toggle_grid()
+
+    def _on_grid_open(self, index: int):
+        """Double click — navigate to image and return to single view."""
+        self._sorter.jump_to(index)
+        if self._grid_mode:
+            self.toggle_grid()
 
     # ------------------------------------------------------------------
     # Category management
