@@ -98,9 +98,10 @@ class TagBar(ttk.Frame):
         self._entry = ttk.Entry(self, textvariable=self._entry_var, width=18,
                                  font=("Segoe UI", 8))
         self._entry.pack(side="left", padx=4)
-        self._entry.bind("<Return>",   self._add_from_entry)
-        self._entry.bind("<Tab>",      self._autocomplete)
+        self._entry.bind("<Return>",     self._add_from_entry)
+        self._entry.bind("<Tab>",        self._autocomplete)
         self._entry.bind("<KeyRelease>", self._on_key_release)
+        self._entry.bind("<Escape>",     self._on_escape)
 
         self._dropdown = tk.Listbox(self, height=5, font=("Segoe UI", 8),
                                      activestyle="dotbox", relief="flat",
@@ -200,6 +201,11 @@ class TagBar(ttk.Frame):
         sel = self._dropdown.curselection()
         if sel:
             self._add_tag(self._dropdown.get(sel[0]))
+
+    def _on_escape(self, _event):
+        self._entry_var.set("")
+        self._hide_dropdown()
+        self.winfo_toplevel().focus_set()  # hand focus back to main window
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +730,8 @@ class MainApp(tk.Tk):
                 self._info_frame.set_status("Undone", "#FF7043")
 
     def _on_tags_changed(self, path: str | None, tags: list[str]):
+        if path:
+            tag_manager.write_tags_to_file(path, tags)
         self._refresh_metadata()
 
     # ------------------------------------------------------------------
