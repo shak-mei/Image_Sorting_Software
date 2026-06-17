@@ -106,10 +106,9 @@ class GridView(ttk.Frame):
         self._load_thread = threading.Thread(target=self._load_thumbs_bg, daemon=True)
         self._load_thread.start()
 
-    def update_status(self, filename: str, action: str):
-        self._status[filename] = action
-        index = next((i for i, f in enumerate(self._all_files)
-                      if os.path.basename(f) == filename), None)
+    def update_status(self, orig_path: str, action: str):
+        self._status[orig_path] = action
+        index = next((i for i, f in enumerate(self._all_files) if f == orig_path), None)
         if index is not None:
             self.after(0, lambda: self._redraw_item(index))
 
@@ -177,7 +176,7 @@ class GridView(ttk.Frame):
     def _draw_item(self, index: int, fpath: str):
         fname = os.path.basename(fpath)
         x, y  = self._cell_xy(index)
-        action = self._status.get(fname, "")
+        action = self._status.get(fpath, "")
         is_current = (index == self._current_index)
 
         bg = SELECTED_BG if is_current else UNSORTED_BG
@@ -223,14 +222,30 @@ class GridView(ttk.Frame):
     def _scroll_to(self, index: int):
         if not self._all_files:
             return
-        _, y = self._cell_xy(index)
         _, ch = self._cell_size()
         total_rows = (len(self._all_files) + self._cols - 1) // self._cols
-        total_h = total_rows * ch
+        total_h = total_rows * ch + PADDING  # must match scrollregion height
         if total_h == 0:
             return
-        frac = y / total_h
-        self._canvas.yview_moveto(max(0.0, frac - 0.1))
+
+        _, cell_y = self._cell_xy(index)
+        cell_top = cell_y
+        cell_bottom = cell_y + ch
+
+        canvas_h = self._canvas.winfo_height() or 600
+        scroll_frac = self._canvas.yview()
+        scroll_top = scroll_frac[0] * total_h
+        scroll_bottom = scroll_top + canvas_h
+
+        if cell_top >= scroll_top and cell_bottom <= scroll_bottom:
+            return  # already fully visible — don't move
+
+        if cell_top < scroll_top:
+            new_top = max(0, cell_top - PADDING)
+        else:
+            new_top = cell_bottom - canvas_h + PADDING
+
+        self._canvas.yview_moveto(max(0.0, min(1.0, new_top / total_h)))
 
     # ------------------------------------------------------------------
     # Background thumbnail loading
@@ -254,8 +269,9 @@ class GridView(ttk.Frame):
         ext = os.path.splitext(fpath)[1].lower()
         if ext in VIDEO_EXTENSIONS:
             return self._video_thumb(fpath, tw, th)
-        img = Image.open(fpath)
-        img = self._fix_orientation(img)
+        with Image.open(fpath) as raw:
+            raw.load()
+            img = self._fix_orientation(raw).copy()
         img.thumbnail((tw, th), Image.LANCZOS)
         return img
 

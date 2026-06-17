@@ -125,22 +125,22 @@ class MetadataPanel(ttk.Frame):
 
     def _populate_image_info(self, image_path: str):
         try:
-            img = Image.open(image_path)
-            self._add_section("Image")
-            self._add_row("Dimensions", f"{img.width} × {img.height}")
-            self._add_row("Mode", img.mode)
+            with Image.open(image_path) as img:
+                self._add_section("Image")
+                self._add_row("Dimensions", f"{img.width} × {img.height}")
+                self._add_row("Mode", img.mode)
 
-            exif_data = img._getexif() if hasattr(img, "_getexif") else None
-            if exif_data:
-                self._add_section("EXIF")
-                tag_map = {v: k for k, v in ExifTags.TAGS.items()}
-                for friendly_key, display_label in EXIF_DISPLAY.items():
-                    tag_id = tag_map.get(friendly_key)
-                    if tag_id and tag_id in exif_data:
-                        raw = exif_data[tag_id]
-                        value = self._format_exif_value(friendly_key, raw)
-                        if value:
-                            self._add_row(display_label, value)
+                exif_data = img._getexif() if hasattr(img, "_getexif") else None
+                if exif_data:
+                    self._add_section("EXIF")
+                    tag_map = {v: k for k, v in ExifTags.TAGS.items()}
+                    for friendly_key, display_label in EXIF_DISPLAY.items():
+                        tag_id = tag_map.get(friendly_key)
+                        if tag_id and tag_id in exif_data:
+                            raw = exif_data[tag_id]
+                            value = self._format_exif_value(friendly_key, raw)
+                            if value:
+                                self._add_row(display_label, value)
         except Exception:
             pass
 

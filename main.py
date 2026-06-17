@@ -65,6 +65,10 @@ class InfoFrame(ttk.Frame):
                                       font=("Segoe UI", 8))
         self._status_lbl.pack(side="right", padx=6)
 
+        self._stats_lbl = ttk.Label(self, text="", foreground="#AAAAAA",
+                                     font=("Segoe UI", 8))
+        self._stats_lbl.pack(side="right", padx=14)
+
     def update_folder_label(self, folder: str):
         self._folder_lbl.configure(text=f"Folder: {_short(folder)}")
 
@@ -74,6 +78,14 @@ class InfoFrame(ttk.Frame):
 
     def set_status(self, text: str, color: str = "#4CAF50"):
         self._status_lbl.configure(text=text, foreground=color)
+
+    def update_stats(self, starred: int, archived: int, unsorted: int, total: int):
+        if total == 0:
+            self._stats_lbl.configure(text="")
+            return
+        self._stats_lbl.configure(
+            text=f"★ {starred}   ☰ {archived}   Unsorted: {unsorted}   /  {total}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +497,8 @@ class SessionSummaryDialog(tk.Toplevel):
         with open(dest, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["filename", "action"])
-            for fname, action in status.items():
-                w.writerow([fname, action or "unsorted"])
+            for fpath, action in status.items():
+                w.writerow([os.path.basename(fpath), action or "unsorted"])
         messagebox.showinfo("Exported", f"Report saved to:\n{dest}", parent=self)
 
 
@@ -543,10 +555,32 @@ class MainApp(tk.Tk):
         self._current_folder: str | None = None
         self._grid_mode = False
         self._meta_visible = False
+        self._view_var = tk.StringVar(value="all")
 
         # -- Info bar --
         self._info_frame = InfoFrame(self)
         self._info_frame.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+
+        # -- View switcher --
+        view_bar = ttk.Frame(self)
+        view_bar.pack(fill="x", padx=8, pady=(2, 0))
+        ttk.Label(view_bar, text="View:", font=("Segoe UI", 8)).pack(side="left", padx=(0, 6))
+        for _vname, _vlabel in [
+            ("all",      "All"),
+            ("unsorted", "Unsorted"),
+            ("starred",  "★  Starred"),
+            ("archive",  "☰  Archive"),
+        ]:
+            ttk.Radiobutton(
+                view_bar, text=_vlabel, value=_vname, variable=self._view_var,
+                style="Toolbutton",
+                command=lambda v=_vname: self.switch_view(v),
+            ).pack(side="left", padx=2, pady=2)
+        ttk.Label(view_bar, text="  (1 / 2 / 3 / 4)", font=("Segoe UI", 7),
+                  foreground="#888888").pack(side="left", padx=4)
+        ttk.Button(view_bar, text="✓  Finalize",
+                   command=self.finalize_session).pack(side="right", padx=6, pady=2)
         ttk.Separator(self, orient="horizontal").pack(fill="x")
 
         # -- Main content area --
@@ -676,6 +710,18 @@ class MainApp(tk.Tk):
             self.return_to_inbox()
         elif key == "q":
             self._on_close()
+        elif key == "1":
+            self._view_var.set("all")
+            self.switch_view("all")
+        elif key == "2":
+            self._view_var.set("all")
+            self.switch_view("unsorted")
+        elif key == "3":
+            self._view_var.set("starred")
+            self.switch_view("starred")
+        elif key == "4":
+            self._view_var.set("archive")
+            self.switch_view("archive")
         elif key == "m":
             self.toggle_metadata()
         elif key == "g":
@@ -691,19 +737,23 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_close(self):
-        sorted_count = sum(1 for v in self._sorter.status.values() if v)
-        if sorted_count == 0:
+        pending = self._sorter.pending_move_count() if self._current_folder else 0
+        if pending == 0:
             if messagebox.askyesno("Exit", "Are you sure you want to quit?", parent=self):
                 self.destroy()
             return
-        dlg = ExitConfirmDialog(self, sorted_count, len(self._sorter.all_files))
-        self.wait_window(dlg)
-        if dlg.result == "exit":
-            self.destroy()
-        elif dlg.result == "summary":
-            summary = SessionSummaryDialog(self, self._sorter.status,
-                                           self._current_folder or "", self._categories)
-            self.wait_window(summary)
+
+        choice = messagebox.askyesnocancel(
+            "Exit — Pending Marks",
+            f"You have {pending} file(s) marked but not yet finalized.\n\n"
+            "Yes    = Finalize (move files) then exit\n"
+            "No     = Exit without moving (marks will be lost)\n"
+            "Cancel = Stay in app",
+            parent=self,
+        )
+        if choice is True:
+            self.finalize_session(then_exit=True)
+        elif choice is False:
             self.destroy()
 
     # ------------------------------------------------------------------
@@ -711,41 +761,112 @@ class MainApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def select_folder(self):
-        sorted_count = sum(1 for v in self._sorter.status.values() if v)
-        if sorted_count > 0:
+        pending = self._sorter.pending_move_count() if self._current_folder else 0
+        if pending > 0:
             choice = messagebox.askyesnocancel(
-                "Active Session",
-                f"You have {sorted_count} sorted image(s) in the current session.\n\n"
-                "View the session summary before loading a new folder?\n\n"
-                "(Yes = show summary first,  No = skip,  Cancel = don't open)",
+                "Pending Marks",
+                f"You have {pending} file(s) marked but not yet finalized.\n\n"
+                "Yes    = Finalize (move files) then open new folder\n"
+                "No     = Discard marks and open new folder\n"
+                "Cancel = Stay",
                 parent=self,
             )
             if choice is None:
                 return
             if choice:
-                dlg = SessionSummaryDialog(self, self._sorter.status,
-                                           self._current_folder or "", self._categories)
-                self.wait_window(dlg)
+                self.finalize_session()
 
         folder = filedialog.askdirectory(title="Select folder containing images")
         if not folder:
             return
         self._current_folder = folder
 
-        # Create subfolders for all categories
-        for cat in self._categories:
-            Path(os.path.join(folder, cat["folder"])).mkdir(exist_ok=True)
-
+        self._view_var.set("all")
         self._info_frame.update_folder_label(folder)
-        self._sorter.select_new_folder(folder)
+        self._sorter.select_new_folder(folder, self._categories)
 
-        # Prime the grid but don't switch to it
         self._grid.load_folder(
             self._sorter.all_files,
             self._sorter.status,
             self._sorter.current_index,
         )
         self._info_frame.set_status("")
+        self._refresh_stats()
+
+    # ------------------------------------------------------------------
+    # View switching
+    # ------------------------------------------------------------------
+
+    def switch_view(self, view_name: str):
+        if not self._current_folder:
+            self._view_var.set("all")
+            return
+
+        self._sorter._activate_view(view_name)
+
+        if not self._sorter.all_files:
+            view_labels = {
+                "unsorted": "Unsorted", "all": "All",
+                "starred": "Starred", "archive": "Archive",
+            }
+            label = view_labels.get(view_name, view_name.title())
+            self._info_frame.set_status(f"No images in {label}", "#FF9800")
+            if view_name != "all":
+                self._view_var.set("all")
+                self._sorter._activate_view("all")
+
+        self._grid.load_folder(
+            self._sorter.all_files,
+            self._sorter.status,
+            self._sorter.current_index,
+        )
+
+        view_labels = {
+            "unsorted": "Unsorted", "all": "All",
+            "starred": "Starred", "archive": "Archive",
+        }
+        label = view_labels.get(view_name, view_name.title())
+        if view_name == "unsorted":
+            self._info_frame.update_folder_label(self._current_folder)
+        else:
+            self._info_frame.update_folder_label(f"[{label}]  {self._current_folder}")
+
+    # ------------------------------------------------------------------
+    # Finalization
+    # ------------------------------------------------------------------
+
+    def finalize_session(self, then_exit: bool = False):
+        """Move all marked files to their destination folders, then reload."""
+        if not self._current_folder:
+            return
+        pending = self._sorter.pending_move_count()
+        if pending == 0 and not then_exit:
+            messagebox.showinfo("Nothing to finalize",
+                                "No files have pending marks.", parent=self)
+            return
+
+        counts = self._sorter.finalize_moves(self._categories)
+
+        if counts:
+            lines = [f"  {cat.title()}: {n}" for cat, n in sorted(counts.items())]
+            msg = f"Moved {sum(counts.values())} file(s):\n" + "\n".join(lines)
+        else:
+            msg = "No files needed to be moved."
+        messagebox.showinfo("Finalization Complete", msg, parent=self)
+
+        if then_exit:
+            self.destroy()
+            return
+
+        # Reload folder so paths and statuses reflect the new file locations
+        self._view_var.set("all")
+        self._sorter.select_new_folder(self._current_folder, self._categories)
+        self._info_frame.update_folder_label(self._current_folder)
+        self._grid.load_folder(
+            self._sorter.all_files, self._sorter.status, self._sorter.current_index
+        )
+        self._info_frame.set_status(f"Finalized — {sum(counts.values())} file(s) moved", "#4CAF50")
+        self._refresh_stats()
 
     # ------------------------------------------------------------------
     # Navigation
@@ -814,23 +935,34 @@ class MainApp(tk.Tk):
     # Callbacks from ImageSorter
     # ------------------------------------------------------------------
 
+    def _refresh_stats(self):
+        if not self._current_folder:
+            return
+        status = self._sorter.status
+        total    = len(self._sorter._master_files)
+        starred  = sum(1 for v in status.values() if v == "starred")
+        archived = sum(1 for v in status.values() if v == "archive")
+        unsorted = sum(1 for v in status.values() if v == "")
+        self._info_frame.update_stats(starred, archived, unsorted, total)
+
     def _on_image_changed(self, index: int, path: str):
         self._tag_bar.load_image(path, self._current_folder)
         self._refresh_metadata()
         if self._grid_mode:
             self._grid.set_current(index)
 
-    def _on_sort(self, index: int, fname: str, action: str):
+    def _on_sort(self, index: int, orig_path: str, action: str):
         if action == "__complete__":
-            self._info_frame.set_status("All sorted!", "#4CAF50")
-            self._show_session_summary()
+            self._info_frame.set_status("All marked! Press Finalize to move files.", "#4CAF50")
+            self._refresh_stats()
             return
-        if fname:
-            self._grid.update_status(fname, action)
+        if orig_path:
+            self._grid.update_status(orig_path, action)
             if action:
                 self._info_frame.set_status(f"→ {action}", "#64B5F6")
             else:
                 self._info_frame.set_status("Undone", "#FF7043")
+        self._refresh_stats()
 
     def _on_tags_changed(self, path: str | None, tags: list[str]):
         if path:
@@ -861,10 +993,6 @@ class MainApp(tk.Tk):
         self.wait_window(dlg)
         if dlg.result is not None:
             self._categories = dlg.result
-            # Create folders if folder is open
-            if self._current_folder:
-                for cat in self._categories:
-                    Path(os.path.join(self._current_folder, cat["folder"])).mkdir(exist_ok=True)
             self._ctrl.rebuild_category_buttons(self._categories)
 
     # ------------------------------------------------------------------

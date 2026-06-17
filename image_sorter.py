@@ -21,12 +21,14 @@ PRELOAD_BEHIND  = 2
 
 class ImageSorter(ttk.Frame):
     """
-    Single-image viewer with:
-    - Image & video display (first frame + Play button for video)
-    - Background preloading
-    - Sort / undo using full image list + status dict (images are never
-      removed from the list so the grid view always has the full picture)
-    - Callbacks: on_image_changed(index, path), on_sort(index, filename, action)
+    Single-image viewer with mark-then-finalize workflow:
+    - Images are never moved during a session; sorting only updates an in-memory
+      status dict.
+    - finalize_moves() performs all the actual file moves at once.
+    - On load, files already in category subfolders are included with their
+      category pre-populated, so the Starred/Archive views show both previous
+      sessions and new marks from the current session.
+    - Callbacks: on_image_changed(index, path), on_sort(index, orig_path, action)
     """
 
     def __init__(self, parent, info_frame,
@@ -37,19 +39,33 @@ class ImageSorter(ttk.Frame):
         self._on_sort          = on_sort
 
         self.current_folder: str | None = None
+
+        # Current view's file list (filtered slice of master data)
         self.all_files: list[str] = []
-        self.status: dict[str, str] = {}
         self.current_index: int = 0
+
+        # Master data — populated once per folder, survives view switches
+        self._master_files: list[str] = []
+        self._master_homes: dict[str, str] = {}          # path → home folder for sorting
+        self._master_initial_status: dict[str, str] = {} # path → status at load time
+        self._inbox_set: set[str] = set()                # paths that live in non-category dirs
+
+        # Shared mutable status — ALL marks for ALL views, keyed by original file path
+        self.status: dict[str, str] = {}
+
+        # Home folders indexed for the current view (rebuilt on each view switch)
+        self._home_folders: dict[int, str] = {}
+
+        # Undo: list of (file_path, prev_status) — no file moves to track
+        self._undo_stack: list[tuple[str, str]] = []
+
+        # View mode: "unsorted", "all", or a category folder name like "starred"/"archive"
+        self._view_mode: str = "all"
 
         self._pil_cache: dict[str, Image.Image] = {}
         self._cache_lock = threading.Lock()
         self._preload_event = threading.Event()
         self._stop_flag = threading.Event()
-
-        # undo stack: (index, path_before_move, path_after_move, prev_status)
-        self._undo_stack: list[tuple[int, str, str, str]] = []
-        # tracks where each file actually is now (may differ from all_files after sorting)
-        self._locations: dict[int, str] = {}
 
         self._image_label = tk.Label(self, bg="#1e1e1e")
         self._image_label.pack(expand=True, fill="both")
@@ -67,43 +83,158 @@ class ImageSorter(ttk.Frame):
     # Folder loading
     # ------------------------------------------------------------------
 
-    def select_new_folder(self, folder: str):
+    def select_new_folder(self, folder: str, categories: list[dict]):
+        """Scan folder recursively, collecting every image/video including those
+        already inside category subfolders.  Sets initial status from location."""
         self.current_folder = folder
         self._stop_flag.set()
         self._pil_cache.clear()
         self._undo_stack.clear()
-        self._locations.clear()
 
-        all_names = sorted(
-            f for f in os.listdir(folder)
-            if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-        )
-        self.all_files = [os.path.join(folder, n) for n in all_names]
-        self.status = {}
+        folder_to_cat = {cat["folder"].lower(): cat["name"].lower() for cat in categories}
 
-        if not self.all_files:
-            messagebox.showinfo("No Media", "No images or videos found in selected folder!")
-            return
+        master_files: list[str] = []
+        master_homes: dict[str, str] = {}
+        master_initial: dict[str, str] = {}
+        inbox_set: set[str] = set()
 
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames.sort()
+            dir_name = os.path.basename(dirpath).lower()
+
+            # Category folders are processed by their parent — skip them here
+            if dir_name in folder_to_cat:
+                dirnames.clear()
+                continue
+
+            # Collect this directory's files together with files already in
+            # category subfolders, then sort the combined list by filename so
+            # the original per-folder order is preserved across all categories.
+            dir_entries: list[tuple[str, str, str, bool]] = []  # (sort_key, fpath, initial_status, in_cat)
+
+            for fname in filenames:
+                if os.path.splitext(fname)[1].lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS:
+                    dir_entries.append((fname.lower(), os.path.join(dirpath, fname), "", False))
+
+            for subdir in os.listdir(dirpath):
+                if subdir.lower() in folder_to_cat:
+                    subdir_path = os.path.join(dirpath, subdir)
+                    if os.path.isdir(subdir_path):
+                        cat_status = folder_to_cat[subdir.lower()]
+                        for fname in os.listdir(subdir_path):
+                            if os.path.splitext(fname)[1].lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS:
+                                dir_entries.append((fname.lower(), os.path.join(subdir_path, fname), cat_status, True))
+
+            dir_entries.sort(key=lambda e: e[0])
+
+            for _, fpath, initial_status, in_cat in dir_entries:
+                master_files.append(fpath)
+                master_homes[fpath] = dirpath
+                master_initial[fpath] = initial_status
+                if not in_cat:
+                    inbox_set.add(fpath)
+
+            # Don't let os.walk descend into category subfolders
+            dirnames[:] = [d for d in dirnames if d.lower() not in folder_to_cat]
+
+        self._master_files = master_files
+        self._master_homes = master_homes
+        self._master_initial_status = master_initial
+        self._inbox_set = inbox_set
+        # Status starts equal to initial (pre-sorted files keep their category)
+        self.status = dict(master_initial)
+
+        self._activate_view("all")
+
+    def _activate_view(self, view_mode: str):
+        """Rebuild all_files and home_folders for the requested view, then show."""
+        self._view_mode = view_mode
+        self._stop_flag.set()
+
+        if view_mode == "unsorted":
+            view_files = [f for f in self._master_files if f in self._inbox_set]
+        elif view_mode == "all":
+            view_files = list(self._master_files)
+        else:
+            view_files = [
+                f for f in self._master_files
+                if self.status.get(f, "") == view_mode
+            ]
+
+        self.all_files = view_files
+        self._home_folders = {i: self._master_homes[f] for i, f in enumerate(view_files)}
         self.current_index = 0
         self._stop_flag.clear()
-        self._preload_event.set()
-        self.show_current()
+
+        if self.all_files:
+            self._preload_event.set()
+            self.show_current()
+
+    def load_category_view(self, target_folder: str, _categories: list[dict] = None):
+        """Switch to a category view (starred / archive / custom)."""
+        if not self.current_folder:
+            return
+        self._activate_view(target_folder.lower())
+
+    # ------------------------------------------------------------------
+    # Finalization — the only place files actually move
+    # ------------------------------------------------------------------
+
+    def finalize_moves(self, categories: list[dict]) -> dict[str, int]:
+        """Move every file to its destination according to the current status.
+        Returns {category_or_inbox: count_moved}."""
+        folder_for = {cat["name"].lower(): cat["folder"] for cat in categories}
+        counts: dict[str, int] = {}
+        errors: list[str] = []
+
+        for fpath in self._master_files:
+            if not os.path.exists(fpath):
+                continue  # already moved (e.g., by a previous finalize)
+            current_status = self.status.get(fpath, "")
+            home = self._master_homes.get(fpath, self.current_folder)
+            fname = os.path.basename(fpath)
+
+            if current_status == "":
+                dest = os.path.join(home, fname)
+            else:
+                cat_folder = folder_for.get(current_status, current_status)
+                dest = os.path.join(home, cat_folder, fname)
+
+            if os.path.normpath(fpath) == os.path.normpath(dest):
+                continue  # already in the right place
+
+            try:
+                Path(os.path.dirname(dest)).mkdir(parents=True, exist_ok=True)
+                shutil.move(fpath, dest)
+                key = current_status if current_status else "unsorted"
+                counts[key] = counts.get(key, 0) + 1
+            except Exception as e:
+                errors.append(f"{fname}: {e}")
+
+        if errors:
+            messagebox.showerror(
+                "Some moves failed",
+                "\n".join(errors[:10]) + ("\n…" if len(errors) > 10 else ""),
+            )
+
+        return counts
+
+    def pending_move_count(self) -> int:
+        """Count files whose current status differs from their status at load time."""
+        return sum(
+            1 for f in self._master_files
+            if self.status.get(f, "") != self._master_initial_status.get(f, "")
+        )
 
     # ------------------------------------------------------------------
     # Display
     # ------------------------------------------------------------------
 
-    def _actual_path(self, index: int) -> str:
-        """Return the file's current physical location (may differ from all_files after sorting)."""
-        loc = self._locations.get(index)
-        return loc if loc is not None else self.all_files[index]
-
     def show_current(self):
         if not self.all_files:
             return
 
-        path = self._actual_path(self.current_index)
+        path = self.all_files[self.current_index]
         ext  = os.path.splitext(path)[1].lower()
         self._current_video_path = None
 
@@ -112,7 +243,7 @@ class ImageSorter(ttk.Frame):
         else:
             self._show_image(path)
 
-        fname = os.path.basename(self.all_files[self.current_index])
+        fname = os.path.basename(path)
         self.info_frame.update_file_label_and_index(
             fname, self.current_index + 1, len(self.all_files)
         )
@@ -190,108 +321,90 @@ class ImageSorter(ttk.Frame):
             self.show_current()
 
     def next_unsorted(self):
-        """Advance to the next image that hasn't been sorted yet."""
+        """Advance to the next image that hasn't been marked yet (unsorted view only)."""
         start = self.current_index + 1
         for i in range(start, len(self.all_files)):
-            fname = os.path.basename(self.all_files[i])
-            if not self.status.get(fname):
+            if not self.status.get(self.all_files[i]):
                 self.current_index = i
                 self.show_current()
                 return
-        unsorted = sum(1 for f in self.all_files
-                       if not self.status.get(os.path.basename(f)))
-        if unsorted == 0:
+        if not any(not self.status.get(f) for f in self.all_files):
             self._signal_complete()
 
     def _signal_complete(self):
         if self._on_sort:
             self._on_sort(-1, "", "__complete__")
 
+    def _advance_after_sort(self):
+        """Next-unmarked in unsorted mode; sequential advance in all other views."""
+        if self._view_mode == "unsorted":
+            self.next_unsorted()
+        elif self.current_index < len(self.all_files) - 1:
+            self.current_index += 1
+            self.show_current()
+
     # ------------------------------------------------------------------
-    # Sorting actions
+    # Sorting — mark only, no file moves
     # ------------------------------------------------------------------
 
     def sort_image(self, category: dict, advance: bool = True):
-        """Move the current image to the category's subfolder.
-
-        advance=False keeps the selection in place (used in grid mode so the
-        user can re-sort the same image without auto-advancing).
-        """
+        """Mark the current image with a category.  No file is moved."""
         if not self.all_files:
             return
         index = self.current_index
-        path = self._actual_path(index)
-        fname = os.path.basename(self.all_files[index])
-        folder_name = category["folder"]
-        dest_dir = os.path.join(self.current_folder, folder_name)
-        Path(dest_dir).mkdir(exist_ok=True)
-        dest = os.path.join(dest_dir, fname)
+        orig_path = self.all_files[index]
+        new_status = category["name"].lower()
+        prev_status = self.status.get(orig_path, "")
 
-        try:
-            shutil.move(path, dest)
-        except Exception as e:
-            messagebox.showerror("Move failed", str(e))
+        if prev_status == new_status:
+            if advance:
+                self._advance_after_sort()
             return
 
-        prev_status = self.status.get(fname, "")
-        self.status[fname] = category["name"].lower()
-        self._undo_stack.append((index, path, dest, prev_status))
-        self._locations[index] = dest
+        self.status[orig_path] = new_status
+        self._undo_stack.append((orig_path, prev_status))
 
         if self._on_sort:
-            self._on_sort(index, fname, category["name"].lower())
+            self._on_sort(index, orig_path, new_status)
 
         if advance:
-            self.next_unsorted()
+            self._advance_after_sort()
 
     def undo_last_move(self):
+        """Undo the last mark change."""
         if not self._undo_stack:
             messagebox.showinfo("Undo", "Nothing to undo.")
             return
 
-        index, original, moved, prev_status = self._undo_stack.pop()
-        fname = os.path.basename(self.all_files[index])
-        try:
-            shutil.move(moved, original)
-        except Exception as e:
-            messagebox.showerror("Undo failed", str(e))
-            return
+        orig_path, prev_status = self._undo_stack.pop()
+        self.status[orig_path] = prev_status
 
-        self.status[fname] = prev_status
-        self._locations[index] = original
+        view_idx = next((i for i, f in enumerate(self.all_files) if f == orig_path), None)
         if self._on_sort:
-            self._on_sort(index, fname, prev_status)
-        self.current_index = index
-        self.show_current()
+            self._on_sort(view_idx if view_idx is not None else -1, orig_path, prev_status)
+        if view_idx is not None:
+            self.current_index = view_idx
+            self.show_current()
 
     def return_to_inbox(self, advance: bool = True):
-        """Move the current image back to the root folder, marking it unsorted."""
+        """Clear the mark on the current image (return it to unsorted state)."""
         if not self.all_files:
             return
         index = self.current_index
-        path  = self._actual_path(index)
-        fname = os.path.basename(self.all_files[index])
-        dest  = os.path.join(self.current_folder, fname)
+        orig_path = self.all_files[index]
+        prev_status = self.status.get(orig_path, "")
 
-        if os.path.normpath(path) == os.path.normpath(dest):
-            return  # already in inbox
+        if not prev_status:
+            return  # already unmarked
 
-        try:
-            shutil.move(path, dest)
-        except Exception as e:
-            messagebox.showerror("Move failed", str(e))
-            return
-
-        prev_status = self.status.get(fname, "")
-        self.status[fname] = ""
-        self._undo_stack.append((index, path, dest, prev_status))
-        self._locations[index] = dest
+        self.status[orig_path] = ""
+        self._undo_stack.append((orig_path, prev_status))
 
         if self._on_sort:
-            self._on_sort(index, fname, "")
+            self._on_sort(index, orig_path, "")
 
         if advance:
-            self.next_unsorted()
+            self._advance_after_sort()
         else:
             self.show_current()
 
@@ -304,9 +417,9 @@ class ImageSorter(ttk.Frame):
         with self._cache_lock:
             if fname in self._pil_cache:
                 return self._pil_cache[fname]
-        img = Image.open(path)
-        img = self._fix_orientation(img)
-        img.load()
+        with Image.open(path) as raw:
+            raw.load()
+            img = self._fix_orientation(raw).copy()
         with self._cache_lock:
             self._pil_cache[fname] = img
         return img
@@ -335,7 +448,7 @@ class ImageSorter(ttk.Frame):
         for idx in indices:
             if self._stop_flag.is_set() or self._preload_event.is_set():
                 break
-            path = self._actual_path(idx)
+            path = self.all_files[idx]
             ext  = os.path.splitext(path)[1].lower()
             if ext in VIDEO_EXTENSIONS:
                 continue
@@ -344,9 +457,9 @@ class ImageSorter(ttk.Frame):
                 if fname in self._pil_cache:
                     continue
             try:
-                img = Image.open(path)
-                img = self._fix_orientation(img)
-                img.load()
+                with Image.open(path) as raw:
+                    raw.load()
+                    img = self._fix_orientation(raw).copy()
                 with self._cache_lock:
                     self._pil_cache[fname] = img
             except Exception:
@@ -375,5 +488,5 @@ class ImageSorter(ttk.Frame):
 
     def current_path(self) -> str | None:
         if self.all_files:
-            return self._actual_path(self.current_index)
+            return self.all_files[self.current_index]
         return None
